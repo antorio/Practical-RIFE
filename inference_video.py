@@ -7,9 +7,20 @@ from tqdm import tqdm
 from torch.nn import functional as F
 import warnings
 import _thread
+
+# ---- NumPy compatibility shim ----
+if not hasattr(np, "float"):
+    np.float = float
+if not hasattr(np, "int"):
+    np.int = int
+if not hasattr(np, "bool"):
+    np.bool = bool
+# ----------------------------------
+
 import skvideo.io
 from queue import Queue, Empty
 from model.pytorch_msssim import ssim_matlab
+
 
 warnings.filterwarnings("ignore")
 
