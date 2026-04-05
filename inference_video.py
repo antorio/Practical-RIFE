@@ -16,16 +16,16 @@ import json
 from queue import Queue
 
 # ---- NumPy compatibility shim (for old deps like skvideo) ----
-if not hasattr(np, "float"):
-	np.float = float
-if not hasattr(np, "int"):
-	np.int = int
-if not hasattr(np, "bool"):
-	np.bool = bool
-if not hasattr(np, "complex"):
-	np.complex = complex
-if not hasattr(np, "object"):
-	np.object = object
+_NP_ALIASES = {
+	"float": float,
+	"int": int,
+	"bool": bool,
+	"complex": complex,
+	"object": object,
+}
+for _alias, _type in _NP_ALIASES.items():
+	if _alias not in np.__dict__:
+		setattr(np, _alias, _type)
 # --------------------------------------------------------------
 
 import skvideo.io
@@ -134,8 +134,10 @@ parser.add_argument('--multi', dest='multi', type=int, default=2, help='fps upsc
 parser.add_argument('--video_codec', dest='video_codec', type=str, default='libx264', help='ffmpeg video codec (e.g. libx264, libx265, ffv1)')
 parser.add_argument('--encode_mode', dest='encode_mode', type=str, default='match', choices=['match', 'crf', 'lossless'], help='match: target source-like quality/bitrate, crf: use CRF, lossless: ffv1')
 parser.add_argument('--crf', dest='crf', type=int, default=18, help='quality factor for CRF mode (lower = better, typical 16~22)')
-parser.add_argument('--preset', dest='preset', type=str, default='medium', help='ffmpeg preset (e.g. veryslow, slow, medium, fast)')
+parser.add_argument('--preset', dest='preset', type=str, default='fast', help='ffmpeg preset (e.g. veryslow, slow, medium, fast, veryfast)')
 parser.add_argument('--pix_fmt', dest='pix_fmt', type=str, default='yuv420p', help='output pixel format (e.g. yuv420p, yuv444p)')
+parser.add_argument('--match_bitrate_scale', dest='match_bitrate_scale', type=float, default=1.0, help='bitrate scale in match mode (default keeps source bitrate)')
+parser.add_argument('--max_bitrate_mbps', dest='max_bitrate_mbps', type=float, default=35.0, help='cap bitrate in match mode to avoid very slow encoding')
 
 args = parser.parse_args()
 
@@ -308,8 +310,9 @@ else:
 		codec_for_output = codec_map.get(source_codec, args.video_codec)
 		pix_fmt_for_output = source_pix_fmt or args.pix_fmt
 		if source_bitrate and source_fps and source_fps > 0:
-			bitrate_scale = float(args.fps) / float(source_fps)
-			bitrate_for_output = int(source_bitrate * max(1.0, bitrate_scale))
+			bitrate_for_output = int(source_bitrate * max(0.1, args.match_bitrate_scale))
+			max_bitrate = int(max(1.0, args.max_bitrate_mbps) * 1_000_000)
+			bitrate_for_output = min(bitrate_for_output, max_bitrate)
 		print(f"Match mode: source codec={source_codec or 'unknown'}, source bitrate={source_bitrate}, scaled target bitrate={bitrate_for_output}")
 
 	try:
