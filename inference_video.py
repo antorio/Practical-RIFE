@@ -90,7 +90,8 @@ parser.add_argument('--scale', dest='scale', type=float, default=1.0, help='Try 
 parser.add_argument('--skip', dest='skip', action='store_true', help='deprecated: remove static frames before processing')
 parser.add_argument('--fps', dest='fps', type=int, default=None)
 parser.add_argument('--png', dest='png', action='store_true', help='write PNG sequence instead of video')
-parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='output video extension')
+# parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='output video extension')
+parser.add_argument('--ext', dest='ext', type=str, default='mkv', help='output video extension')
 parser.add_argument('--exp', dest='exp', type=int, default=1, help='2**exp = multi')
 parser.add_argument('--multi', dest='multi', type=int, default=2, help='fps upscaling factor')
 
@@ -157,7 +158,8 @@ if args.video is not None:
 	except StopIteration:
 		raise RuntimeError("No frames found in input video.")
 
-	fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
+	# fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
+	fourcc = cv2.VideoWriter_fourcc(*'FFV1')
 	video_path_wo_ext, in_ext = os.path.splitext(args.video)
 	print(f'{video_path_wo_ext}.{args.ext}, {tot_frame} frames in total, {fps:.3f} FPS to {args.fps:.3f} FPS')
 	if (not args.png) and fpsNotAssigned:
@@ -318,12 +320,14 @@ while True:
 	if args.montage:
 		write_buffer.put(np.concatenate((lastframe, lastframe), 1))
 		for mid in output:
-			mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
+			# mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
+			mid = (mid[0] * 255.0).clamp(0, 255).round().byte().cpu().numpy().transpose(1, 2, 0)
 			write_buffer.put(np.concatenate((lastframe, mid[:h, :w]), 1))
 	else:
 		write_buffer.put(lastframe)
 		for mid in output:
-			mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
+			# mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
+			mid = (mid[0] * 255.0).clamp(0, 255).round().byte().cpu().numpy().transpose(1, 2, 0)
 			write_buffer.put(mid[:h, :w])
 
 	pbar.update(1)
