@@ -46,23 +46,7 @@ def transferAudio(sourceVideo, targetVideo):
 	temp_dir = "./temp"
 	os.makedirs(temp_dir, exist_ok=True)
 
-	# Check if source has audio
-	check_cmd = [
-		"ffprobe", "-v", "error",
-		"-select_streams", "a",
-		"-show_entries", "stream=index",
-		"-of", "csv=p=0",
-		sourceVideo
-	]
-
-	result = subprocess.run(check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-	# No audio detected
-	if result.stdout.strip() == b"":
-		print("No audio stream found. Skipping audio transfer.")
-		return
-
-	# 1) Try lossless audio copy
+	# 1) Try lossless audio copy (container must support stream-copy)
 	audio_copy = os.path.join(temp_dir, "audio.mkv")
 	run_ffmpeg(["ffmpeg", "-y", "-i", sourceVideo, "-c:a", "copy", "-vn", audio_copy])
 
@@ -74,19 +58,24 @@ def transferAudio(sourceVideo, targetVideo):
 	try:
 		run_ffmpeg(["ffmpeg", "-y", "-i", targetNoAudio, "-i", audio_copy, "-c", "copy", targetVideo])
 	except Exception:
+		# 2) Fallback: transcode audio to AAC
 		audio_aac = os.path.join(temp_dir, "audio.m4a")
 		run_ffmpeg(["ffmpeg", "-y", "-i", sourceVideo, "-c:a", "aac", "-b:a", "160k", "-vn", audio_aac])
-
 		try:
 			run_ffmpeg(["ffmpeg", "-y", "-i", targetNoAudio, "-i", audio_aac, "-c", "copy", targetVideo])
+			print("Lossless audio transfer failed. Audio was transcoded to AAC (M4A) instead.")
 		except Exception:
+			# If still fails, keep the no-audio video
 			os.rename(targetNoAudio, targetVideo)
+			print("Audio transfer failed. Interpolated video will have no audio")
 			shutil.rmtree(temp_dir, ignore_errors=True)
 			return
 
+	# success path — remove the audio-less video
 	if os.path.exists(targetNoAudio):
 		os.remove(targetNoAudio)
 
+	# cleanup
 	shutil.rmtree(temp_dir, ignore_errors=True)
 
 parser = argparse.ArgumentParser(description='Interpolation for a pair of images / a video using RIFE')
@@ -101,8 +90,7 @@ parser.add_argument('--scale', dest='scale', type=float, default=1.0, help='Try 
 parser.add_argument('--skip', dest='skip', action='store_true', help='deprecated: remove static frames before processing')
 parser.add_argument('--fps', dest='fps', type=int, default=None)
 parser.add_argument('--png', dest='png', action='store_true', help='write PNG sequence instead of video')
-# parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='output video extension')
-parser.add_argument('--ext', dest='ext', type=str, default='mkv', help='output video extension')
+parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='output video extension')
 parser.add_argument('--exp', dest='exp', type=int, default=1, help='2**exp = multi')
 parser.add_argument('--multi', dest='multi', type=int, default=2, help='fps upscaling factor')
 
@@ -169,8 +157,7 @@ if args.video is not None:
 	except StopIteration:
 		raise RuntimeError("No frames found in input video.")
 
-	# fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
-	fourcc = cv2.VideoWriter_fourcc(*'FFV1')
+	fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
 	video_path_wo_ext, in_ext = os.path.splitext(args.video)
 	print(f'{video_path_wo_ext}.{args.ext}, {tot_frame} frames in total, {fps:.3f} FPS to {args.fps:.3f} FPS')
 	if (not args.png) and fpsNotAssigned:
@@ -331,14 +318,12 @@ while True:
 	if args.montage:
 		write_buffer.put(np.concatenate((lastframe, lastframe), 1))
 		for mid in output:
-			# mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
-			mid = (mid[0] * 255.0).clamp(0, 255).round().byte().cpu().numpy().transpose(1, 2, 0)
+			mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
 			write_buffer.put(np.concatenate((lastframe, mid[:h, :w]), 1))
 	else:
 		write_buffer.put(lastframe)
 		for mid in output:
-			# mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
-			mid = (mid[0] * 255.0).clamp(0, 255).round().byte().cpu().numpy().transpose(1, 2, 0)
+			mid = (mid[0] * 255.0).byte().cpu().numpy().transpose(1, 2, 0)
 			write_buffer.put(mid[:h, :w])
 
 	pbar.update(1)
