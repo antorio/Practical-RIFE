@@ -11,7 +11,9 @@ from torch.nn import functional as F
 import warnings
 import threading
 import subprocess
-from queue import Queue, Empty
+import tempfile
+import json
+from queue import Queue
 
 # ---- NumPy compatibility shim (for old deps like skvideo) ----
 if not hasattr(np, "float"):
@@ -40,11 +42,47 @@ def run_ffmpeg(args_list):
 			f"stderr:\n{result.stderr.decode(errors='ignore')}"
 		)
 
+def probe_video_stream(video_path):
+	"""Return codec/pix_fmt/bitrate/fps from ffprobe if available; otherwise empty dict."""
+	cmd = [
+		"ffprobe", "-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=codec_name,pix_fmt,bit_rate,r_frame_rate:format=bit_rate",
+		"-of", "json",
+		video_path
+	]
+	try:
+		result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+		data = json.loads(result.stdout.decode(errors="ignore"))
+		stream = (data.get("streams") or [{}])[0]
+		format_info = data.get("format") or {}
+
+		codec = stream.get("codec_name")
+		pix_fmt = stream.get("pix_fmt")
+
+		br = stream.get("bit_rate") or format_info.get("bit_rate")
+		bitrate = int(br) if br and str(br).isdigit() else None
+
+		r_frame_rate = stream.get("r_frame_rate", "0/1")
+		try:
+			num, den = r_frame_rate.split("/")
+			fps = float(num) / max(float(den), 1.0)
+		except Exception:
+			fps = None
+
+		return {
+			"codec": codec,
+			"pix_fmt": pix_fmt,
+			"bitrate": bitrate,
+			"fps": fps,
+		}
+	except Exception:
+		return {}
+
 def transferAudio(sourceVideo, targetVideo):
 	import shutil
 
-	temp_dir = "./temp"
-	os.makedirs(temp_dir, exist_ok=True)
+	temp_dir = tempfile.mkdtemp(prefix="rife_audio_")
 
 	# 1) Try lossless audio copy (container must support stream-copy)
 	audio_copy = os.path.join(temp_dir, "audio.mkv")
@@ -93,6 +131,11 @@ parser.add_argument('--png', dest='png', action='store_true', help='write PNG se
 parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='output video extension')
 parser.add_argument('--exp', dest='exp', type=int, default=1, help='2**exp = multi')
 parser.add_argument('--multi', dest='multi', type=int, default=2, help='fps upscaling factor')
+parser.add_argument('--video_codec', dest='video_codec', type=str, default='libx264', help='ffmpeg video codec (e.g. libx264, libx265, ffv1)')
+parser.add_argument('--encode_mode', dest='encode_mode', type=str, default='match', choices=['match', 'crf', 'lossless'], help='match: target source-like quality/bitrate, crf: use CRF, lossless: ffv1')
+parser.add_argument('--crf', dest='crf', type=int, default=18, help='quality factor for CRF mode (lower = better, typical 16~22)')
+parser.add_argument('--preset', dest='preset', type=str, default='medium', help='ffmpeg preset (e.g. veryslow, slow, medium, fast)')
+parser.add_argument('--pix_fmt', dest='pix_fmt', type=str, default='yuv420p', help='output pixel format (e.g. yuv420p, yuv444p)')
 
 args = parser.parse_args()
 
@@ -133,6 +176,7 @@ model.device()
 
 # ---- Input handling
 fpsNotAssigned = False
+source_stream = {}
 if args.video is not None:
 	if not os.path.exists(args.video):
 		raise FileNotFoundError(f"Input video not found: {args.video}")
@@ -152,6 +196,7 @@ if args.video is not None:
 		fpsNotAssigned = False
 
 	videogen = skvideo.io.vreader(args.video)
+	source_stream = probe_video_stream(args.video)
 	try:
 		lastframe = next(videogen)
 	except StopIteration:
@@ -183,13 +228,110 @@ else:
 h, w, _ = lastframe.shape
 vid_out_name = None
 vid_out = None
+
+class FFmpegPipeWriter:
+	def __init__(self, path, fps, width, height, codec, crf, preset, pix_fmt, bitrate=None, extra_args=None):
+		self.path = path
+		self.closed = False
+		cmd = [
+			"ffmpeg", "-y",
+			"-f", "rawvideo",
+			"-pix_fmt", "bgr24",
+			"-s", f"{width}x{height}",
+			"-r", f"{fps}",
+			"-i", "-",
+			"-an",
+			"-c:v", codec,
+		]
+		codec_lower = codec.lower()
+		if codec_lower not in {"ffv1", "huffyuv", "rawvideo"}:
+			cmd += ["-preset", preset, "-crf", str(crf)]
+		if bitrate is not None and bitrate > 0:
+			kbps = max(1, int(bitrate / 1000))
+			cmd += ["-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k"]
+		if pix_fmt:
+			cmd += ["-pix_fmt", pix_fmt]
+		if extra_args:
+			cmd += list(extra_args)
+		cmd += [path]
+
+		self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+		if self.proc.stdin is None:
+			raise RuntimeError("Failed to initialize ffmpeg stdin pipe.")
+
+	def write(self, frame_bgr):
+		if self.closed:
+			raise RuntimeError("Attempted to write to a closed FFmpeg writer.")
+		try:
+			self.proc.stdin.write(frame_bgr.tobytes())
+		except BrokenPipeError:
+			stderr = self.proc.stderr.read().decode(errors="ignore") if self.proc.stderr else ""
+			raise RuntimeError(f"FFmpeg pipe broken while writing video frames.\n{stderr}")
+
+	def release(self):
+		if self.closed:
+			return
+		self.closed = True
+		if self.proc.stdin:
+			self.proc.stdin.close()
+		returncode = self.proc.wait()
+		stderr = self.proc.stderr.read().decode(errors="ignore") if self.proc.stderr else ""
+		if returncode != 0:
+			raise RuntimeError(f"FFmpeg encoding failed ({returncode}).\n{stderr}")
+
 if args.png:
 	os.makedirs('vid_out', exist_ok=True)
 else:
 	vid_out_name = args.output if args.output else f'{video_path_wo_ext}_{args.multi}X_{int(np.round(args.fps))}.{args.ext}'
-	vid_out = cv2.VideoWriter(vid_out_name, fourcc, args.fps, (w, h))
-	if not vid_out.isOpened():
-		raise RuntimeError(f"Failed to open video writer for: {vid_out_name}")
+	codec_for_output = args.video_codec
+	crf_for_output = args.crf
+	preset_for_output = args.preset
+	pix_fmt_for_output = args.pix_fmt
+	bitrate_for_output = None
+
+	if args.encode_mode == "lossless":
+		codec_for_output = "ffv1"
+		if args.ext.lower() != "mkv":
+			print("[WARN] Lossless mode is most compatible with MKV container. Consider --ext mkv.")
+	elif args.encode_mode == "match" and args.video is not None:
+		source_codec = (source_stream.get("codec") or "").lower()
+		source_pix_fmt = source_stream.get("pix_fmt")
+		source_bitrate = source_stream.get("bitrate")
+		source_fps = source_stream.get("fps") or fps
+		codec_map = {
+			"h264": "libx264",
+			"hevc": "libx265",
+			"h265": "libx265",
+			"vp9": "libvpx-vp9",
+			"av1": "libaom-av1"
+		}
+		codec_for_output = codec_map.get(source_codec, args.video_codec)
+		pix_fmt_for_output = source_pix_fmt or args.pix_fmt
+		if source_bitrate and source_fps and source_fps > 0:
+			bitrate_scale = float(args.fps) / float(source_fps)
+			bitrate_for_output = int(source_bitrate * max(1.0, bitrate_scale))
+		print(f"Match mode: source codec={source_codec or 'unknown'}, source bitrate={source_bitrate}, scaled target bitrate={bitrate_for_output}")
+
+	try:
+		vid_out = FFmpegPipeWriter(
+			path=vid_out_name,
+			fps=args.fps,
+			width=w,
+			height=h,
+			codec=codec_for_output,
+			crf=crf_for_output,
+			preset=preset_for_output,
+			pix_fmt=pix_fmt_for_output,
+			bitrate=bitrate_for_output
+		)
+		print(f"Encoding with ffmpeg mode={args.encode_mode}, codec={codec_for_output}, crf={crf_for_output}, preset={preset_for_output}, pix_fmt={pix_fmt_for_output}, bitrate={bitrate_for_output}")
+	except Exception as e:
+		print(f"[WARN] FFmpeg writer init failed: {e}")
+		print("[WARN] Falling back to OpenCV writer (mp4v), which may reduce visual quality.")
+		fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
+		vid_out = cv2.VideoWriter(vid_out_name, fourcc, args.fps, (w, h))
+		if not vid_out.isOpened():
+			raise RuntimeError(f"Failed to open video writer for: {vid_out_name}")
 
 # ---- Helpers
 def pad_image(img):
@@ -344,7 +486,10 @@ writer.join()
 
 pbar.close()
 if vid_out is not None:
-	vid_out.release()
+	try:
+		vid_out.release()
+	except Exception as e:
+		raise RuntimeError(f"Failed to finalize output video '{vid_out_name}': {e}")
 
 # ---- Audio merge (only for video path, original-fps case)
 if (not args.png) and fpsNotAssigned and (args.video is not None):
