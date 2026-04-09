@@ -39,7 +39,54 @@ def run_ffmpeg(args_list):
 			f"ffmpeg failed ({result.returncode}): {' '.join(args_list)}\n"
 			f"stderr:\n{result.stderr.decode(errors='ignore')}"
 		)
+class FFmpegPipeWriter:
+    """Replacement for cv2.VideoWriter that pipes raw frames to ffmpeg.
+    Drop-in: same .write(bgr_frame) and .release() interface.
+    """
+    def __init__(self, path, fps, width, height, crf=18, preset='slow', codec='libx264', pix_fmt='yuv420p'):
+        self.path = path
+        self.width = width
+        self.height = height
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{width}x{height}',
+            '-r', str(fps),
+            '-i', 'pipe:0',
+            '-vcodec', codec,
+            '-crf', str(crf),
+            '-preset', preset,
+            '-pix_fmt', pix_fmt,
+            '-movflags', '+faststart',
+            path
+        ]
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
+    def isOpened(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def write(self, frame):
+        try:
+            self.proc.stdin.write(frame.tobytes())
+        except BrokenPipeError:
+            raise RuntimeError(f"FFmpeg pipe closed unexpectedly while writing to {self.path}")
+
+    def release(self):
+        if self.proc and self.proc.stdin:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+        if self.proc:
+            self.proc.wait()
+            self.proc = None
 def transferAudio(sourceVideo, targetVideo):
 	import shutil
 
@@ -93,6 +140,8 @@ parser.add_argument('--png', dest='png', action='store_true', help='write PNG se
 parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='output video extension')
 parser.add_argument('--exp', dest='exp', type=int, default=1, help='2**exp = multi')
 parser.add_argument('--multi', dest='multi', type=int, default=2, help='fps upscaling factor')
+parser.add_argument('--crf', dest='crf', type=int, default=18, help='CRF quality (lower = better, 18 is near-lossless for H.264)')
+parser.add_argument('--codec', dest='codec', type=str, default='libx264', help='video codec, e.g. libx264, libx265, libsvtav1')
 
 args = parser.parse_args()
 
@@ -157,7 +206,7 @@ if args.video is not None:
 	except StopIteration:
 		raise RuntimeError("No frames found in input video.")
 
-	fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
+	# fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
 	video_path_wo_ext, in_ext = os.path.splitext(args.video)
 	print(f'{video_path_wo_ext}.{args.ext}, {tot_frame} frames in total, {fps:.3f} FPS to {args.fps:.3f} FPS')
 	if (not args.png) and fpsNotAssigned:
@@ -187,9 +236,9 @@ if args.png:
 	os.makedirs('vid_out', exist_ok=True)
 else:
 	vid_out_name = args.output if args.output else f'{video_path_wo_ext}_{args.multi}X_{int(np.round(args.fps))}.{args.ext}'
-	vid_out = cv2.VideoWriter(vid_out_name, fourcc, args.fps, (w, h))
+	vid_out = FFmpegPipeWriter(vid_out_name, args.fps, w, h, crf=args.crf, codec=args.codec)
 	if not vid_out.isOpened():
-		raise RuntimeError(f"Failed to open video writer for: {vid_out_name}")
+    	raise RuntimeError(f"Failed to open ffmpeg writer for: {vid_out_name}")
 
 # ---- Helpers
 def pad_image(img):
